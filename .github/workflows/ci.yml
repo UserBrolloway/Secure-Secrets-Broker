@@ -19,7 +19,7 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+          --health-interval 10s --health-timeout 5s --health-retries 5
       vault:
         image: hashicorp/vault:1.14.0
         env:
@@ -28,14 +28,57 @@ jobs:
         ports:
           - 8200:8200
         options: >-
-          --health-cmd "vault status" --health-interval 10s --health-timeout 5s --health-retries 5
+          --health-interval 10s --health-timeout 5s --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.10"
+
+      - name: Wait for Postgres to be ready
+        run: |
+          echo "Waiting for Postgres..."
+          for i in $(seq 1 30); do
+            docker run --rm --network host postgres:15 pg_isready -h host.docker.internal -p 5432 -U postgres >/dev/null 2>&1 && break || true
+            # Try direct localhost fallback (Actions networking can vary)
+            if docker run --rm postgres:15 pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1; then
+              break
+            fi
+            echo "Postgres not ready yet (attempt $i/30) - sleeping 2s"
+            sleep 2
+          done
+          echo "Postgres wait complete (if still failing, check service logs)"
+
+      - name: Wait for Vault HTTP health endpoint
+        run: |
+          echo "Waiting for Vault HTTP health endpoint at http://localhost:8200 ..."
+          for i in $(seq 1 60); do
+            if curl -sS --fail "http://localhost:8200/v1/sys/health?standbyok=true" >/dev/null 2>&1; then
+              echo "Vault is responding"
+              break
+            fi
+            echo "Vault not ready yet (attempt $i/60) - sleeping 2s"
+            sleep 2
+          done
+          echo "Vault HTTP response (for debugging):"
+          curl -sS "http://localhost:8200/v1/sys/health?standbyok=true" || true
+
+      - name: Debug: list containers and show Vault logs (always)
+        if: always()
+        run: |
+          echo "Docker containers (short):"
+          docker ps -a --format "table {{.ID}}\t{{.Image}}\t{{.Status}}\t{{.Names}}"
+          echo "Vault logs (last 200 lines) if any container uses the vault image:"
+          for cid in $(docker ps -a -q --filter ancestor=hashicorp/vault:1.14.0); do
+            echo "=== logs for container $cid ==="
+            docker logs --tail 200 $cid || true
+          done
+
       - name: Install deps
         run: pip install -r requirements.txt
+
       - name: Run unit tests
         run: pytest -q tests/test_issue_unit.py
